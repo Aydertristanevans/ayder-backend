@@ -1,5 +1,5 @@
 from fastapi import FastAPI, APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -33,8 +33,12 @@ import random
 import string
 
 # MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
+mongo_url = os.environ.get('MONGO_URL', '')
+if not mongo_url:
+    print("WARNING: MONGO_URL not set. Please add it in Railway Variables tab.")
+    # Use a placeholder so the server can at least start for healthcheck
+    mongo_url = "mongodb://localhost:27017"
+client = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=5000)
 db = client[os.environ.get('DB_NAME', 'ayder_production')]
 
 # Create the main app without a prefix
@@ -1430,6 +1434,18 @@ Kind regards,
 
 # Include the router in the main app
 app.include_router(api_router)
+
+# Temporary download endpoint for deployment files
+@app.get("/api/download-backend")
+async def download_backend_zip():
+    zip_path = Path(__file__).parent / "ayder-backend-deploy.zip"
+    if zip_path.exists():
+        return FileResponse(
+            path=str(zip_path),
+            filename="ayder-backend-deploy.zip",
+            media_type="application/zip"
+        )
+    raise HTTPException(status_code=404, detail="Zip file not found")
 
 app.add_middleware(
     CORSMiddleware,
