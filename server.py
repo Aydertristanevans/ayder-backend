@@ -1,5 +1,5 @@
 from fastapi import FastAPI, APIRouter, HTTPException
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -31,6 +31,7 @@ SMTP_PORT = int(os.environ.get('SMTP_PORT', '587'))
 
 import random
 import string
+import httpx
 
 # MongoDB connection
 mongo_url = os.environ.get('MONGO_URL', '')
@@ -64,6 +65,7 @@ class User(BaseModel):
     name: str = ""
     role: str = "user"  # user, admin
     verified: bool = False
+    approved: bool = False
     accepted_terms: bool = False
     accepted_terms_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -281,6 +283,7 @@ class Receipt(BaseModel):
     attachment_name: str = ""
     status: str = "submitted"  # submitted, approved, rejected
     invoice_id: Optional[str] = None
+    user_id: str = ""
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 class ReceiptCreate(BaseModel):
@@ -345,6 +348,7 @@ class Invoice(BaseModel):
     due_date: str = ""
     notes: str = ""
     status: str = "draft"  # draft, sent, paid, overdue
+    user_id: str = ""
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 class InvoiceCreate(BaseModel):
@@ -445,6 +449,7 @@ class TravelRecord(BaseModel):
     client_name: Optional[str] = None
     client_id: Optional[str] = None
     invoice_id: Optional[str] = None
+    user_id: str = ""
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 class TravelRecordCreate(BaseModel):
@@ -455,6 +460,64 @@ class TravelRecordCreate(BaseModel):
     end_km: float
     client_name: Optional[str] = None
     client_id: Optional[str] = None
+
+
+# ====== FILE MODELS ======
+
+class UserFile(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    filename: str
+    file_type: str = ""  # pdf, image, doc, etc.
+    file_size: int = 0  # bytes
+    file_data: str = ""  # Base64 encoded
+    category: str = "general"  # general, certification, policy, training
+    user_id: str = ""
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class FileUpload(BaseModel):
+    filename: str
+    file_type: str = ""
+    file_size: int = 0
+    file_data: str = ""
+    category: str = "general"
+
+
+# ====== NOTIFICATION MODEL ======
+
+class AppNotification(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    user_id: str  # who receives this notification
+    type: str = "info"  # approval, info, success, warning, alert
+    title: str
+    description: str
+    is_read: bool = False
+    related_id: str = ""  # e.g. user_id of person awaiting approval
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# ====== MESSAGING MODELS ======
+
+class Conversation(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    participants: list = Field(default_factory=list)  # List of user_ids
+    last_message: str = ""
+    last_message_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class Message(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    conversation_id: str
+    sender_id: str
+    content: str
+    is_read: bool = False
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class SendMessage(BaseModel):
+    content: str
+
+class StartConversation(BaseModel):
+    participant_id: str
+    message: str = ""
 
 
 # Health check
@@ -471,8 +534,9 @@ def generate_verification_code() -> str:
 def send_verification_email(to_email: str, code: str, name: str = "") -> bool:
     try:
         if not SMTP_EMAIL or not SMTP_PASSWORD:
-            logging.warning("SMTP not configured, cannot send verification email")
+            logging.warning(f"SMTP not configured (EMAIL={bool(SMTP_EMAIL)}, PASS={bool(SMTP_PASSWORD)}), cannot send verification email to {to_email}")
             return False
+        logging.info(f"Attempting to send verification email to {to_email} via {SMTP_HOST}:{SMTP_PORT}")
         
         msg = MIMEMultipart('alternative')
         msg['From'] = f"Ayder <{SMTP_EMAIL}>"
@@ -551,10 +615,18 @@ async def register(req: RegisterRequest):
     # Send verification email
     email_sent = send_verification_email(user.email, code, user.name)
     
+    # Notify admins about new user registration
+    await notify_admins(
+        title="New User Awaiting Approval",
+        description=f"{user.name or user.email} has registered and is awaiting approval.",
+        notification_type="approval",
+        related_id=user.id,
+    )
+    
     token = jwt.encode({"user_id": user.id, "email": user.email, "role": user.role}, JWT_SECRET, algorithm="HS256")
     return {
         "token": token,
-        "user": {"id": user.id, "email": user.email, "name": user.name, "role": user.role, "verified": False, "accepted_terms": False},
+        "user": {"id": user.id, "email": user.email, "name": user.name, "role": user.role, "verified": False, "accepted_terms": False, "approved": False},
         "email_sent": email_sent,
         "requires_verification": True,
     }
@@ -590,7 +662,7 @@ async def verify_email(req: VerifyRequest):
     token = jwt.encode({"user_id": user['id'], "email": user['email'], "role": user.get('role', 'user')}, JWT_SECRET, algorithm="HS256")
     return {
         "token": token,
-        "user": {"id": user['id'], "email": user['email'], "name": user.get('name', ''), "role": user.get('role', 'user'), "verified": True, "accepted_terms": user.get('accepted_terms', False)},
+        "user": {"id": user['id'], "email": user['email'], "name": user.get('name', ''), "role": user.get('role', 'user'), "verified": True, "accepted_terms": user.get('accepted_terms', False), "approved": user.get('approved', False)},
         "message": "Email verified successfully",
     }
 
@@ -635,11 +707,29 @@ async def login(req: LoginRequest):
     
     is_verified = user.get('verified', True)  # Default True for existing/admin users
     has_accepted_terms = user.get('accepted_terms', True)  # Default True for existing/admin users
+    is_approved = user.get('approved', True)  # Default True for existing/admin users
     token = jwt.encode({"user_id": user['id'], "email": user['email'], "role": user.get('role', 'user')}, JWT_SECRET, algorithm="HS256")
+    
+    email_sent = False
+    # Auto-send verification code when unverified user logs in
+    if not is_verified:
+        code = generate_verification_code()
+        await db.verification_codes.delete_many({"email": user['email']})
+        await db.verification_codes.insert_one({
+            "email": user['email'],
+            "code": code,
+            "created_at": datetime.utcnow(),
+            "attempts": 0,
+        })
+        email_sent = send_verification_email(user['email'], code, user.get('name', ''))
+        logging.info(f"Auto-sent verification email on login to {user['email']}: {'success' if email_sent else 'failed'}")
+    
     return {
         "token": token,
-        "user": {"id": user['id'], "email": user['email'], "name": user.get('name', ''), "role": user.get('role', 'user'), "verified": is_verified, "accepted_terms": has_accepted_terms},
+        "user": {"id": user['id'], "email": user['email'], "name": user.get('name', ''), "role": user.get('role', 'user'), "verified": is_verified, "accepted_terms": has_accepted_terms, "approved": is_approved},
         "requires_verification": not is_verified,
+        "pending_approval": not is_approved,
+        "email_sent": email_sent,
     }
 
 
@@ -656,9 +746,212 @@ async def accept_terms(req: AcceptTermsRequest):
     token = jwt.encode({"user_id": user['id'], "email": user['email'], "role": user.get('role', 'user')}, JWT_SECRET, algorithm="HS256")
     return {
         "token": token,
-        "user": {"id": user['id'], "email": user['email'], "name": user.get('name', ''), "role": user.get('role', 'user'), "verified": user.get('verified', True), "accepted_terms": True},
+        "user": {"id": user['id'], "email": user['email'], "name": user.get('name', ''), "role": user.get('role', 'user'), "verified": user.get('verified', True), "accepted_terms": True, "approved": user.get('approved', False)},
         "message": "Terms accepted successfully",
     }
+
+
+# ====== PUSH NOTIFICATIONS ======
+
+async def send_expo_push_notification(push_token: str, title: str, body: str, data: dict = None):
+    """Send a push notification via Expo's push notification service."""
+    try:
+        if not push_token or not push_token.startswith('ExponentPushToken'):
+            return False
+        message = {
+            "to": push_token,
+            "sound": "default",
+            "title": title,
+            "body": body,
+        }
+        if data:
+            message["data"] = data
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://exp.host/--/api/v2/push/send",
+                json=message,
+                headers={"Content-Type": "application/json"},
+            )
+            logging.info(f"Push notification sent to {push_token[:30]}...: {resp.status_code}")
+            return resp.status_code == 200
+    except Exception as e:
+        logging.error(f"Failed to send push notification: {e}")
+        return False
+
+
+class PushTokenRequest(BaseModel):
+    push_token: str
+
+
+@api_router.post("/auth/push-token")
+async def register_push_token(req: PushTokenRequest, x_user_id: str = Header(default="")):
+    if not x_user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    await db.users.update_one(
+        {"id": x_user_id},
+        {"$set": {"push_token": req.push_token}}
+    )
+    return {"message": "Push token registered"}
+
+
+@api_router.delete("/auth/delete-account")
+async def delete_account(x_user_id: str = Header(default="")):
+    if not x_user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    user = await db.users.find_one({"id": x_user_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.get('role') == 'admin':
+        raise HTTPException(status_code=403, detail="Admin accounts cannot be deleted this way")
+    
+    # Delete all user data
+    user_email = user.get('email', '')
+    await db.users.delete_one({"id": x_user_id})
+    await db.verification_codes.delete_many({"email": user_email})
+    await db.profile.delete_many({"user_id": x_user_id})
+    await db.tasks.delete_many({"user_id": x_user_id})
+    await db.shifts.delete_many({"user_id": x_user_id})
+    await db.clients.delete_many({"user_id": x_user_id})
+    await db.receipts.delete_many({"user_id": x_user_id})
+    await db.invoices.delete_many({"user_id": x_user_id})
+    await db.travel_records.delete_many({"user_id": x_user_id})
+    await db.files.delete_many({"user_id": x_user_id})
+    await db.notifications.delete_many({"user_id": x_user_id})
+    # Remove from conversations and messages
+    await db.messages.delete_many({"sender_id": x_user_id})
+    user_convos = await db.conversations.find({"participants": x_user_id}).to_list(100)
+    for convo in user_convos:
+        if len(convo.get('participants', [])) <= 2:
+            await db.conversations.delete_one({"id": convo['id']})
+            await db.messages.delete_many({"conversation_id": convo['id']})
+    
+    logging.info(f"Account deleted for user {user_email}")
+    return {"message": "Account deleted successfully"}
+
+
+# ====== ADMIN ENDPOINTS ======
+
+def send_approval_email(to_email: str, name: str = "") -> bool:
+    try:
+        if not SMTP_EMAIL or not SMTP_PASSWORD:
+            logging.warning("SMTP not configured, cannot send approval email")
+            return False
+        
+        msg = MIMEMultipart('alternative')
+        msg['From'] = f"Ayder <{SMTP_EMAIL}>"
+        msg['To'] = to_email
+        msg['Subject'] = "Welcome to Ayder - Your Account Has Been Approved!"
+        
+        html_body = f"""
+        <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 480px; margin: 0 auto; padding: 40px 24px; background-color: #F0F4F8;">
+            <div style="text-align: center; margin-bottom: 32px;">
+                <h1 style="color: #00B8A9; font-size: 28px; margin: 0;">Ayder</h1>
+                <p style="color: #666; font-size: 14px; margin-top: 4px;">Task & Client Management</p>
+            </div>
+            <div style="background: white; border-radius: 20px; padding: 32px; box-shadow: 0 2px 12px rgba(0,0,0,0.08);">
+                <h2 style="color: #1A3C40; font-size: 20px; font-weight: 800; margin-top: 0;">Account Approved!</h2>
+                <p style="color: #666; font-size: 14px; line-height: 1.5;">
+                    Hi{' ' + name if name else ''},<br><br>
+                    Great news! Your Ayder account has been approved. You can now log in and start using the app.
+                </p>
+                <div style="text-align: center; margin: 28px 0;">
+                    <div style="display: inline-block; background: #E8F8F7; border: 2px solid #00B8A9; border-radius: 16px; padding: 16px 40px;">
+                        <span style="font-size: 24px; font-weight: 900; color: #00B8A9;">You're In!</span>
+                    </div>
+                </div>
+                <p style="color: #999; font-size: 12px; text-align: center;">
+                    Open the Ayder app and log in with your email to get started.
+                </p>
+            </div>
+            <p style="color: #999; font-size: 11px; text-align: center; margin-top: 24px;">
+                &copy; 2025 Ayder. All rights reserved.
+            </p>
+        </div>
+        """
+        
+        msg.attach(MIMEText(html_body, 'html'))
+        
+        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
+        server.starttls()
+        server.login(SMTP_EMAIL, SMTP_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        logging.info(f"Approval email sent to {to_email}")
+        return True
+    except Exception as e:
+        logging.error(f"Failed to send approval email: {e}")
+        return False
+
+
+@api_router.get("/admin/pending-users")
+async def get_pending_users(x_user_id: str = Header(default="")):
+    # Verify the requesting user is admin
+    admin = await db.users.find_one({"id": x_user_id, "role": "admin"})
+    if not admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    # Match users where approved is False OR approved field doesn't exist
+    users = await db.users.find({"$or": [{"approved": False}, {"approved": {"$exists": False}}], "role": {"$ne": "admin"}}).to_list(100)
+    return [{"id": u['id'], "email": u['email'], "name": u.get('name', ''), "verified": u.get('verified', False), "accepted_terms": u.get('accepted_terms', False), "created_at": str(u.get('created_at', ''))} for u in users]
+
+
+@api_router.get("/admin/approved-users")
+async def get_approved_users(x_user_id: str = Header(default="")):
+    admin = await db.users.find_one({"id": x_user_id, "role": "admin"})
+    if not admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    users = await db.users.find({"approved": True, "role": {"$ne": "admin"}}).to_list(100)
+    return [{"id": u['id'], "email": u['email'], "name": u.get('name', ''), "verified": u.get('verified', False), "created_at": str(u.get('created_at', ''))} for u in users]
+
+
+@api_router.post("/admin/approve-user/{user_id}")
+async def approve_user(user_id: str, x_user_id: str = Header(default="")):
+    # Verify the requesting user is admin
+    admin = await db.users.find_one({"id": x_user_id, "role": "admin"})
+    if not admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    user = await db.users.find_one({"id": user_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    await db.users.update_one({"id": user_id}, {"$set": {"approved": True}})
+    
+    # Send approval email
+    email_sent = send_approval_email(user['email'], user.get('name', ''))
+    
+    return {"message": "User approved successfully", "email_sent": email_sent, "user_id": user_id}
+
+
+@api_router.post("/admin/unapprove-user/{user_id}")
+async def unapprove_user(user_id: str, x_user_id: str = Header(default="")):
+    admin = await db.users.find_one({"id": x_user_id, "role": "admin"})
+    if not admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    user = await db.users.find_one({"id": user_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    await db.users.update_one({"id": user_id}, {"$set": {"approved": False}})
+    return {"message": "User access revoked", "user_id": user_id}
+
+
+@api_router.post("/admin/decline-user/{user_id}")
+async def decline_user(user_id: str, x_user_id: str = Header(default="")):
+    admin = await db.users.find_one({"id": x_user_id, "role": "admin"})
+    if not admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    user = await db.users.find_one({"id": user_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Delete the user and their verification codes
+    await db.users.delete_one({"id": user_id})
+    await db.verification_codes.delete_many({"email": user.get('email', '')})
+    return {"message": "User declined and removed", "user_id": user_id}
 
 
 # Task Endpoints
@@ -1084,6 +1377,17 @@ async def delete_whs_incident(incident_id: str):
         raise HTTPException(status_code=404, detail="WHS Incident not found")
     return {"message": "WHS Incident deleted successfully"}
 
+
+@api_router.put("/whs-incidents/{incident_id}", response_model=WHSIncident)
+async def update_whs_incident(incident_id: str, incident_input: WHSIncidentCreate):
+    existing = await db.whs_incidents.find_one({"id": incident_id})
+    if not existing:
+        raise HTTPException(status_code=404, detail="WHS Incident not found")
+    update_data = {k: v for k, v in incident_input.dict().items() if v is not None}
+    await db.whs_incidents.update_one({"id": incident_id}, {"$set": update_data})
+    updated = await db.whs_incidents.find_one({"id": incident_id})
+    return WHSIncident(**updated)
+
 # Travel Record Endpoints
 @api_router.post("/travel-records", response_model=TravelRecord)
 async def create_travel_record(record_input: TravelRecordCreate, x_user_id: str = Header(default="")):
@@ -1125,6 +1429,243 @@ async def update_travel_record(record_id: str, record_input: TravelRecordCreate)
     await db.travel_records.update_one({"id": record_id}, {"$set": update_data})
     updated = await db.travel_records.find_one({"id": record_id})
     return TravelRecord(**updated)
+
+# ====== FILE ENDPOINTS ======
+
+@api_router.post("/files")
+async def upload_file(file_input: FileUpload, x_user_id: str = Header(default="")):
+    file_obj = UserFile(
+        filename=file_input.filename,
+        file_type=file_input.file_type,
+        file_size=file_input.file_size,
+        file_data=file_input.file_data,
+        category=file_input.category,
+        user_id=x_user_id,
+    )
+    await db.user_files.insert_one(file_obj.dict())
+    return {"id": file_obj.id, "filename": file_obj.filename, "file_type": file_obj.file_type, "file_size": file_obj.file_size, "category": file_obj.category, "created_at": str(file_obj.created_at)}
+
+@api_router.get("/files")
+async def get_files(x_user_id: str = Header(default="")):
+    query = {"user_id": x_user_id} if x_user_id else {}
+    files = await db.user_files.find(query).sort("created_at", -1).to_list(100)
+    return [{"id": f['id'], "filename": f['filename'], "file_type": f.get('file_type', ''), "file_size": f.get('file_size', 0), "category": f.get('category', 'general'), "created_at": str(f.get('created_at', ''))} for f in files]
+
+@api_router.get("/files/{file_id}")
+async def get_file(file_id: str):
+    f = await db.user_files.find_one({"id": file_id})
+    if not f:
+        raise HTTPException(status_code=404, detail="File not found")
+    return {"id": f['id'], "filename": f['filename'], "file_type": f.get('file_type', ''), "file_size": f.get('file_size', 0), "file_data": f.get('file_data', ''), "category": f.get('category', ''), "created_at": str(f.get('created_at', ''))}
+
+@api_router.delete("/files/{file_id}")
+async def delete_file(file_id: str):
+    result = await db.user_files.delete_one({"id": file_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="File not found")
+    return {"message": "File deleted successfully"}
+
+
+# ====== NOTIFICATION ENDPOINTS ======
+
+@api_router.get("/notifications")
+async def get_notifications(x_user_id: str = Header(default="")):
+    query = {"user_id": x_user_id} if x_user_id else {}
+    notifications = await db.notifications.find(query).sort("created_at", -1).to_list(50)
+    return [{
+        "id": n['id'],
+        "type": n.get('type', 'info'),
+        "title": n.get('title', ''),
+        "description": n.get('description', ''),
+        "is_read": n.get('is_read', False),
+        "related_id": n.get('related_id', ''),
+        "created_at": str(n.get('created_at', '')),
+    } for n in notifications]
+
+@api_router.get("/notifications/unread-count")
+async def get_unread_count(x_user_id: str = Header(default="")):
+    count = await db.notifications.count_documents({"user_id": x_user_id, "is_read": False})
+    return {"count": count}
+
+@api_router.post("/notifications/mark-read/{notification_id}")
+async def mark_notification_read(notification_id: str):
+    await db.notifications.update_one({"id": notification_id}, {"$set": {"is_read": True}})
+    return {"message": "Notification marked as read"}
+
+@api_router.post("/notifications/mark-all-read")
+async def mark_all_read(x_user_id: str = Header(default="")):
+    await db.notifications.update_many({"user_id": x_user_id, "is_read": False}, {"$set": {"is_read": True}})
+    return {"message": "All notifications marked as read"}
+
+@api_router.delete("/notifications/{notification_id}")
+async def delete_notification(notification_id: str):
+    await db.notifications.delete_one({"id": notification_id})
+    return {"message": "Notification deleted"}
+
+
+# Helper to create notification for all admins
+async def notify_admins(title: str, description: str, notification_type: str = "approval", related_id: str = ""):
+    admins = await db.users.find({"role": "admin"}).to_list(100)
+    for admin in admins:
+        notif = AppNotification(
+            user_id=admin['id'],
+            type=notification_type,
+            title=title,
+            description=description,
+            related_id=related_id,
+        )
+        await db.notifications.insert_one(notif.dict())
+
+
+# ====== MESSAGING ENDPOINTS ======
+
+@api_router.get("/conversations")
+async def get_conversations(x_user_id: str = Header(default="")):
+    convos = await db.conversations.find({"participants": x_user_id}).sort("last_message_at", -1).to_list(50)
+    result = []
+    for c in convos:
+        # Get the other participant's info
+        other_ids = [p for p in c.get('participants', []) if p != x_user_id]
+        other_user = None
+        if other_ids:
+            other_user = await db.users.find_one({"id": other_ids[0]})
+        # Count unread messages
+        unread = await db.messages.count_documents({"conversation_id": c['id'], "sender_id": {"$ne": x_user_id}, "is_read": False})
+        # Get profile photo
+        profile = await db.profile.find_one({"user_id": other_ids[0]}) if other_ids else None
+        participant_photo = profile.get('profile_photo', '') if profile else ''
+        result.append({
+            "id": c['id'],
+            "participant_name": other_user.get('name', '') or other_user.get('email', '') if other_user else 'Unknown',
+            "participant_id": other_ids[0] if other_ids else '',
+            "participant_photo": participant_photo,
+            "last_message": c.get('last_message', ''),
+            "last_message_at": str(c.get('last_message_at', c.get('created_at', ''))),
+            "unread_count": unread,
+        })
+    return result
+
+@api_router.post("/conversations")
+async def start_conversation(req: StartConversation, x_user_id: str = Header(default="")):
+    # Check if conversation already exists between these two users
+    existing = await db.conversations.find_one({
+        "participants": {"$all": [x_user_id, req.participant_id], "$size": 2}
+    })
+    if existing:
+        convo_id = existing['id']
+    else:
+        convo = Conversation(
+            participants=[x_user_id, req.participant_id],
+        )
+        await db.conversations.insert_one(convo.dict())
+        convo_id = convo.id
+
+    # Send initial message if provided
+    if req.message.strip():
+        msg = Message(
+            conversation_id=convo_id,
+            sender_id=x_user_id,
+            content=req.message.strip(),
+        )
+        await db.messages.insert_one(msg.dict())
+        await db.conversations.update_one(
+            {"id": convo_id},
+            {"$set": {"last_message": req.message.strip(), "last_message_at": datetime.utcnow()}}
+        )
+
+    return {"conversation_id": convo_id}
+
+@api_router.get("/conversations/{conversation_id}/messages")
+async def get_messages(conversation_id: str, x_user_id: str = Header(default="")):
+    messages = await db.messages.find({"conversation_id": conversation_id}).sort("created_at", 1).to_list(200)
+    # Mark received messages as read
+    await db.messages.update_many(
+        {"conversation_id": conversation_id, "sender_id": {"$ne": x_user_id}, "is_read": False},
+        {"$set": {"is_read": True}}
+    )
+    return [{
+        "id": m['id'],
+        "sender_id": m['sender_id'],
+        "content": m['content'],
+        "is_read": m.get('is_read', False),
+        "created_at": str(m.get('created_at', '')),
+    } for m in messages]
+
+
+@api_router.delete("/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str, x_user_id: str = Header(default="")):
+    convo = await db.conversations.find_one({"id": conversation_id})
+    if not convo:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if x_user_id not in convo.get('participants', []):
+        raise HTTPException(status_code=403, detail="Not a participant")
+    await db.conversations.delete_one({"id": conversation_id})
+    await db.messages.delete_many({"conversation_id": conversation_id})
+    return {"message": "Conversation deleted"}
+
+
+@api_router.post("/conversations/{conversation_id}/messages")
+async def send_message(conversation_id: str, req: SendMessage, x_user_id: str = Header(default="")):
+    msg = Message(
+        conversation_id=conversation_id,
+        sender_id=x_user_id,
+        content=req.content.strip(),
+    )
+    await db.messages.insert_one(msg.dict())
+    await db.conversations.update_one(
+        {"id": conversation_id},
+        {"$set": {"last_message": req.content.strip(), "last_message_at": datetime.utcnow()}}
+    )
+    
+    # Send push notification to the other participant(s)
+    convo = await db.conversations.find_one({"id": conversation_id})
+    if convo:
+        sender = await db.users.find_one({"id": x_user_id})
+        sender_name = sender.get('name', 'Someone') if sender else 'Someone'
+        for participant_id in convo.get('participants', []):
+            if participant_id != x_user_id:
+                recipient = await db.users.find_one({"id": participant_id})
+                if recipient and recipient.get('push_token'):
+                    await send_expo_push_notification(
+                        push_token=recipient['push_token'],
+                        title=f"New message from {sender_name}",
+                        body=req.content.strip()[:100],
+                        data={"conversation_id": conversation_id, "type": "message"},
+                    )
+    
+    return {"id": msg.id, "content": msg.content, "created_at": str(msg.created_at)}
+
+@api_router.get("/users/list")
+async def list_users(x_user_id: str = Header(default="")):
+    """List messageable users. Regular users only see admin. Admin sees all approved users."""
+    requesting_user = await db.users.find_one({"id": x_user_id})
+    if not requesting_user:
+        raise HTTPException(status_code=401, detail="User not found")
+    
+    is_admin = requesting_user.get('role') == 'admin'
+    
+    if is_admin:
+        # Admin can message all approved users
+        users = await db.users.find({"approved": True, "id": {"$ne": x_user_id}}).to_list(100)
+    else:
+        # Regular users can only message admin
+        users = await db.users.find({"role": "admin"}).to_list(100)
+    
+    result = []
+    for u in users:
+        # Get profile photo if exists
+        profile = await db.profile.find_one({"user_id": u['id']})
+        profile_photo = profile.get('profile_photo', '') if profile else ''
+        result.append({
+            "id": u['id'],
+            "name": u.get('name', ''),
+            "email": u.get('email', ''),
+            "role": u.get('role', 'user'),
+            "profile_photo": profile_photo,
+        })
+    
+    return result
+
 
 # PDF Generation helper
 def generate_invoice_pdf(invoice_data: dict, profile_data: dict) -> bytes:
@@ -1435,18 +1976,6 @@ Kind regards,
 # Include the router in the main app
 app.include_router(api_router)
 
-# Temporary download endpoint for deployment files
-@app.get("/api/download-backend")
-async def download_backend_zip():
-    zip_path = Path(__file__).parent / "ayder-backend-deploy.zip"
-    if zip_path.exists():
-        return FileResponse(
-            path=str(zip_path),
-            filename="ayder-backend-deploy.zip",
-            media_type="application/zip"
-        )
-    raise HTTPException(status_code=404, detail="Zip file not found")
-
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
@@ -1466,23 +1995,29 @@ logger = logging.getLogger(__name__)
 async def seed_admin():
     existing = await db.users.find_one({"email": "tristan.evans@ayder.com.au"})
     if not existing:
-        password_hash = bcrypt.hashpw("1234".encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        password_hash = bcrypt.hashpw("Jingela137".encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
         admin = User(
             email="tristan.evans@ayder.com.au",
             password_hash=password_hash,
-            name="Tristan Evans",
+            name="Admin",
             role="admin",
             verified=True,
+            approved=True,
             accepted_terms=True,
         )
         await db.users.insert_one(admin.dict())
         print("Admin account seeded: tristan.evans@ayder.com.au")
     else:
-        # Ensure existing admin is verified and has accepted terms
-        await db.users.update_one({"email": "tristan.evans@ayder.com.au"}, {"$set": {"verified": True, "accepted_terms": True}})
+        # Ensure existing admin is verified, approved and has accepted terms
+        # Also update password to the new one
+        password_hash = bcrypt.hashpw("Jingela137".encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        await db.users.update_one({"email": "tristan.evans@ayder.com.au"}, {"$set": {"verified": True, "accepted_terms": True, "approved": True, "role": "admin", "password_hash": password_hash, "name": "Admin"}})
+        # Also update profile name
+        await db.profile.update_one({"user_id": existing['id']}, {"$set": {"name": "Admin"}}, upsert=True)
     # Create TTL index for verification codes (auto-expire after 10 min)
     await db.verification_codes.create_index("created_at", expireAfterSeconds=600)
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
     client.close()
+
