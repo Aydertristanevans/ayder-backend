@@ -1,5 +1,5 @@
-from fastapi import FastAPI, APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse, HTMLResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -88,6 +88,13 @@ class ResendCodeRequest(BaseModel):
 
 class AcceptTermsRequest(BaseModel):
     email: str
+
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
 class Task(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     title: str
@@ -585,6 +592,60 @@ def send_verification_email(to_email: str, code: str, name: str = "") -> bool:
         return False
 
 
+def send_reset_email(to_email: str, reset_link: str, name: str = "") -> bool:
+    try:
+        if not SMTP_EMAIL or not SMTP_PASSWORD:
+            logging.warning(f"SMTP not configured, cannot send reset email to {to_email}")
+            return False
+        logging.info(f"Sending password reset email to {to_email}")
+
+        msg = MIMEMultipart('alternative')
+        msg['From'] = f"Ayder <{SMTP_EMAIL}>"
+        msg['To'] = to_email
+        msg['Subject'] = "Reset Your Ayder Password"
+
+        html_body = f"""
+        <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 480px; margin: 0 auto; padding: 40px 24px; background-color: #F0F4F8;">
+            <div style="text-align: center; margin-bottom: 32px;">
+                <h1 style="color: #00B8A9; font-size: 28px; margin: 0;">Ayder</h1>
+                <p style="color: #666; font-size: 14px; margin-top: 4px;">Task & Client Management</p>
+            </div>
+            <div style="background: white; border-radius: 20px; padding: 32px; box-shadow: 0 2px 12px rgba(0,0,0,0.08);">
+                <h2 style="color: #1A3C40; font-size: 20px; font-weight: 800; margin-top: 0;">Password Reset</h2>
+                <p style="color: #666; font-size: 14px; line-height: 1.5;">
+                    Hi{' ' + name if name else ''},<br><br>
+                    We received a request to reset your password. Click the button below to set a new password:
+                </p>
+                <div style="text-align: center; margin: 28px 0;">
+                    <a href="{reset_link}" style="display: inline-block; background: #00B8A9; color: white; text-decoration: none; padding: 16px 40px; border-radius: 14px; font-size: 16px; font-weight: 700;">
+                        Reset Password
+                    </a>
+                </div>
+                <p style="color: #999; font-size: 12px; text-align: center;">
+                    This link expires in 30 minutes.<br>
+                    If you didn't request a password reset, you can safely ignore this email.
+                </p>
+            </div>
+            <p style="color: #999; font-size: 11px; text-align: center; margin-top: 24px;">
+                &copy; 2025 Ayder. All rights reserved.
+            </p>
+        </div>
+        """
+
+        msg.attach(MIMEText(html_body, 'html'))
+
+        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
+        server.starttls()
+        server.login(SMTP_EMAIL, SMTP_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        logging.info(f"Password reset email sent to {to_email}")
+        return True
+    except Exception as e:
+        logging.error(f"Failed to send reset email: {e}")
+        return False
+
+
 # ====== AUTH ENDPOINTS ======
 
 @api_router.post("/auth/register")
@@ -695,6 +756,181 @@ async def resend_verification_code(req: ResendCodeRequest):
     
     email_sent = send_verification_email(email, code, user.get('name', ''))
     return {"email_sent": email_sent, "message": "Verification code sent"}
+
+
+@api_router.post("/auth/forgot-password")
+async def forgot_password(req: ForgotPasswordRequest, request: Request):
+    email = req.email.lower().strip()
+    user = await db.users.find_one({"email": email})
+    # Always return success to prevent email enumeration
+    if not user:
+        return {"message": "If an account with that email exists, a reset link has been sent."}
+
+    # Rate limit: 60 seconds between requests
+    existing = await db.password_resets.find_one({"email": email})
+    if existing:
+        elapsed = (datetime.utcnow() - existing['created_at']).total_seconds()
+        if elapsed < 60:
+            raise HTTPException(status_code=429, detail=f"Please wait {int(60 - elapsed)} seconds before requesting another reset")
+
+    # Generate reset token
+    reset_token = str(uuid.uuid4())
+    await db.password_resets.delete_many({"email": email})
+    await db.password_resets.insert_one({
+        "email": email,
+        "token": reset_token,
+        "created_at": datetime.utcnow(),
+    })
+
+    # Build reset link using the request's base URL
+    base_url = str(request.base_url).rstrip('/')
+    reset_link = f"{base_url}/api/auth/reset-page/{reset_token}"
+
+    email_sent = send_reset_email(email, reset_link, user.get('name', ''))
+    return {"message": "If an account with that email exists, a reset link has been sent.", "email_sent": email_sent}
+
+
+@api_router.get("/auth/reset-page/{token}")
+async def reset_password_page(token: str):
+    """Serve an HTML page where the user can enter a new password."""
+    record = await db.password_resets.find_one({"token": token})
+
+    if not record:
+        return HTMLResponse(content="""
+        <html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;background:#F0F4F8;}
+        .card{background:white;border-radius:20px;padding:40px;max-width:400px;width:90%;text-align:center;box-shadow:0 2px 12px rgba(0,0,0,0.08);}
+        h1{color:#00B8A9;font-size:28px;margin:0 0 8px;}h2{color:#1A3C40;font-size:20px;}p{color:#666;font-size:14px;}</style>
+        </head><body><div class="card"><h1>Ayder</h1><h2>Invalid or Expired Link</h2><p>This password reset link is invalid or has already been used. Please request a new one from the app.</p></div></body></html>
+        """, status_code=400)
+
+    # Check expiry (30 minutes)
+    elapsed = (datetime.utcnow() - record['created_at']).total_seconds()
+    if elapsed > 1800:
+        await db.password_resets.delete_one({"token": token})
+        return HTMLResponse(content="""
+        <html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;background:#F0F4F8;}
+        .card{background:white;border-radius:20px;padding:40px;max-width:400px;width:90%;text-align:center;box-shadow:0 2px 12px rgba(0,0,0,0.08);}
+        h1{color:#00B8A9;font-size:28px;margin:0 0 8px;}h2{color:#1A3C40;font-size:20px;}p{color:#666;font-size:14px;}</style>
+        </head><body><div class="card"><h1>Ayder</h1><h2>Link Expired</h2><p>This password reset link has expired. Please request a new one from the app.</p></div></body></html>
+        """, status_code=400)
+
+    return HTMLResponse(content=f"""
+    <html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+    *{{box-sizing:border-box;}}
+    body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;background:#F0F4F8;padding:20px;}}
+    .card{{background:white;border-radius:20px;padding:40px;max-width:420px;width:100%;box-shadow:0 2px 12px rgba(0,0,0,0.08);}}
+    h1{{color:#00B8A9;font-size:28px;margin:0 0 4px;text-align:center;}}
+    .tagline{{color:#666;font-size:13px;text-align:center;margin-bottom:24px;}}
+    h2{{color:#1A3C40;font-size:20px;font-weight:800;margin:0 0 8px;}}
+    .subtitle{{color:#666;font-size:14px;margin-bottom:24px;}}
+    label{{display:block;font-size:13px;font-weight:700;color:#1A3C40;margin-bottom:6px;}}
+    input{{width:100%;padding:14px 16px;border:1px solid #E5E7EB;border-radius:12px;font-size:15px;background:#F8F9FA;outline:none;margin-bottom:16px;}}
+    input:focus{{border-color:#00B8A9;background:white;}}
+    button{{width:100%;padding:16px;background:#00B8A9;color:white;border:none;border-radius:14px;font-size:16px;font-weight:700;cursor:pointer;}}
+    button:hover{{background:#009e93;}}
+    button:disabled{{opacity:0.6;cursor:not-allowed;}}
+    .error{{background:#FEF2F2;border:1px solid #FECACA;border-radius:10px;padding:12px;color:#DC3545;font-size:13px;font-weight:600;margin-bottom:16px;display:none;}}
+    .success{{background:#F0FDF4;border:1px solid #BBF7D0;border-radius:10px;padding:12px;color:#16A34A;font-size:13px;font-weight:600;margin-bottom:16px;display:none;text-align:center;}}
+    .req{{color:#999;font-size:12px;margin-bottom:16px;}}
+    </style></head>
+    <body>
+    <div class="card">
+        <h1>Ayder</h1>
+        <p class="tagline">Task & Client Management</p>
+        <h2>Set New Password</h2>
+        <p class="subtitle">Enter your new password below.</p>
+        <div id="error" class="error"></div>
+        <div id="success" class="success"></div>
+        <form id="resetForm" onsubmit="return handleSubmit(event)">
+            <label>New Password</label>
+            <input type="password" id="password" placeholder="Enter new password" required minlength="6" />
+            <label>Confirm Password</label>
+            <input type="password" id="confirmPassword" placeholder="Confirm new password" required minlength="6" />
+            <p class="req">Password must be at least 6 characters long.</p>
+            <button type="submit" id="submitBtn">Reset Password</button>
+        </form>
+    </div>
+    <script>
+    async function handleSubmit(e) {{
+        e.preventDefault();
+        const pw = document.getElementById('password').value;
+        const cpw = document.getElementById('confirmPassword').value;
+        const errEl = document.getElementById('error');
+        const successEl = document.getElementById('success');
+        const btn = document.getElementById('submitBtn');
+        errEl.style.display = 'none';
+        successEl.style.display = 'none';
+
+        if (pw.length < 6) {{
+            errEl.textContent = 'Password must be at least 6 characters.';
+            errEl.style.display = 'block';
+            return false;
+        }}
+        if (pw !== cpw) {{
+            errEl.textContent = 'Passwords do not match.';
+            errEl.style.display = 'block';
+            return false;
+        }}
+
+        btn.disabled = true;
+        btn.textContent = 'Resetting...';
+
+        try {{
+            const res = await fetch('/api/auth/reset-password', {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{token: '{token}', new_password: pw}})
+            }});
+            const data = await res.json();
+            if (res.ok) {{
+                successEl.textContent = 'Password reset successfully! You can now log in with your new password in the Ayder app.';
+                successEl.style.display = 'block';
+                document.getElementById('resetForm').style.display = 'none';
+            }} else {{
+                errEl.textContent = data.detail || 'Failed to reset password.';
+                errEl.style.display = 'block';
+                btn.disabled = false;
+                btn.textContent = 'Reset Password';
+            }}
+        }} catch (err) {{
+            errEl.textContent = 'Network error. Please try again.';
+            errEl.style.display = 'block';
+            btn.disabled = false;
+            btn.textContent = 'Reset Password';
+        }}
+        return false;
+    }}
+    </script>
+    </body></html>
+    """)
+
+
+@api_router.post("/auth/reset-password")
+async def reset_password(req: ResetPasswordRequest):
+    record = await db.password_resets.find_one({"token": req.token})
+    if not record:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+
+    # Check expiry (30 minutes)
+    elapsed = (datetime.utcnow() - record['created_at']).total_seconds()
+    if elapsed > 1800:
+        await db.password_resets.delete_one({"token": req.token})
+        raise HTTPException(status_code=400, detail="Reset token has expired. Please request a new one.")
+
+    if len(req.new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+
+    # Update password
+    password_hash = bcrypt.hashpw(req.new_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    await db.users.update_one({"email": record['email']}, {"$set": {"password_hash": password_hash}})
+
+    # Invalidate the token
+    await db.password_resets.delete_many({"email": record['email']})
+
+    return {"message": "Password reset successfully"}
 
 
 @api_router.post("/auth/login")
@@ -1973,6 +2209,18 @@ Kind regards,
         raise HTTPException(status_code=500, detail=f"Failed to send email: {str(e)}")
 
 
+
+# Temporary file download endpoint
+from fastapi.responses import FileResponse as FR
+@api_router.get("/download/backend-files")
+async def download_backend_files():
+    import os
+    fp = "/app/backend-files.zip"
+    if os.path.exists(fp):
+        return FR(fp, filename="backend-files.zip", media_type="application/zip")
+    raise HTTPException(status_code=404, detail="File not found")
+
+
 # Include the router in the main app
 app.include_router(api_router)
 
@@ -2020,4 +2268,3 @@ async def seed_admin():
 @app.on_event("shutdown")
 async def shutdown_db_client():
     client.close()
-
